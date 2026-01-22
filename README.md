@@ -4,9 +4,6 @@ Small MCP server exposing Daraja Sandbox tools over STDIO so Copilot Agent (MCP)
 
 Quick start
 
-1. Copy `.env.example` to `.env` and fill `DARAJA_CONSUMER_KEY` / `DARAJA_CONSUMER_SECRET`.
-2. Install deps:
-
 ```powershell
 pip install -r requirements.txt
 ```

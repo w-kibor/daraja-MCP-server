@@ -9,6 +9,10 @@ fh = logging.FileHandler('m_pesa_debug.log', encoding='utf-8')
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 fh.setFormatter(formatter)
 logger.addHandler(fh)
+# Also log to stderr so humans see startup progress (won't interfere with stdout JSON)
+sh = logging.StreamHandler(sys.stderr)
+sh.setFormatter(formatter)
+logger.addHandler(sh)
 
 
 def send_response(req_id, result=None, error=None):
@@ -23,7 +27,9 @@ def send_response(req_id, result=None, error=None):
 
 
 def main():
+    logger.debug("Creating DarajaClient instance")
     client = DarajaClient()
+    logger.debug("DarajaClient instance created")
     # Expose the tools with hyper-explicit signatures and descriptions
     tools = {
         name: {"func": getattr(client, name), "description": meta["description"], "args": meta.get("args", {})}
@@ -31,6 +37,7 @@ def main():
     }
 
     logger.info("MCP server started, waiting for STDIO messages")
+    logger.debug("Entering STDIN loop to receive messages")
 
     for line in sys.stdin:
         line = line.strip()

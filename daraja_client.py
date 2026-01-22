@@ -7,6 +7,9 @@ from typing import Optional, Dict, Any
 
 import requests
 from dotenv import load_dotenv
+import re
+import difflib
+from typing import List
 
 load_dotenv()
 
@@ -46,6 +49,9 @@ class DarajaClient:
 
         self._token: Optional[str] = None
         self._token_expires_at: float = 0
+        # documentation index cache: list of (paragraph, source_url)
+        self._docs_index: List[tuple] = []
+        self._docs_sources: List[str] = [os.getenv('DARAJA_DOCS_URL', 'https://developer.safaricom.co.ke/')]
 
     def _get_timestamp(self) -> str:
         return datetime.utcnow().strftime('%Y%m%d%H%M%S')
@@ -164,6 +170,114 @@ class DarajaClient:
         r.raise_for_status()
         return r.json()
 
+    # -- Documentation indexing and search -------------------------------------------------
+    def _extract_text_paragraphs(self, html: str) -> List[str]:
+        # Very small, robust HTML -> text stripper to get paragraphs
+        text = re.sub(r'(?is)<script.*?>.*?</script>', '', html)
+        text = re.sub(r'(?is)<style.*?>.*?</style>', '', text)
+        # Replace common block tags with newlines
+        text = re.sub(r'(?i)</?(p|div|h[1-6]|li|br|section|article)[^>]*>', '\n', text)
+        # Remove remaining tags
+        text = re.sub(r'<[^>]+>', '', text)
+        # Collapse whitespace
+        text = re.sub(r'\n{2,}', '\n\n', text)
+        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+        return paragraphs
+
+    def _build_docs_index(self) -> None:
+        if self._docs_index:
+            return
+        for src in self._docs_sources:
+            try:
+                logger.debug('Fetching docs from %s', src)
+                r = requests.get(src, timeout=10)
+                r.raise_for_status()
+                paras = self._extract_text_paragraphs(r.text)
+                for p in paras:
+                    # keep short paragraphs too
+                    self._docs_index.append((p, src))
+                logger.info('Indexed %d paragraphs from %s', len(paras), src)
+            except Exception as e:
+                logger.exception('Failed to fetch docs from %s: %s', src, e)
+
+    def doc_search(self, query: str, top_n: int = 1) -> Dict[str, Any]:
+        """Search indexed Daraja docs for the paragraph best matching `query`.
+
+        Returns a dict with `query`, `matches` (list of {'paragraph','source','score'}).
+        """
+        if not query or not query.strip():
+            raise ValueError('query must be a non-empty string')
+
+        # lazy index build (non-blocking attempts with reasonable timeouts)
+        if not self._docs_index:
+            self._build_docs_index()
+
+        if not self._docs_index:
+            return {'query': query, 'matches': [], 'note': 'No documentation indexed; set DARAJA_DOCS_URL or ensure network access.'}
+
+        # Compute similarity using difflib ratio; also boost exact-token matches
+        candidates = []
+        q = query.lower()
+        for para, src in self._docs_index:
+            p_low = para.lower()
+            ratio = difflib.SequenceMatcher(None, q, p_low).ratio()
+            # token overlap boost
+            q_tokens = set(re.findall(r"\w+", q))
+            p_tokens = set(re.findall(r"\w+", p_low))
+            if q_tokens:
+                overlap = len(q_tokens & p_tokens) / len(q_tokens)
+            else:
+                overlap = 0.0
+            score = 0.6 * ratio + 0.4 * overlap
+            candidates.append((score, para, src))
+
+        candidates.sort(reverse=True, key=lambda t: t[0])
+        results = []
+        for score, para, src in candidates[:top_n]:
+            results.append({'paragraph': para, 'source': src, 'score': round(float(score), 4)})
+
+        return {'query': query, 'matches': results}
+
+    def start_ngrok_and_register(self, port: int = 8000, callback_path: str = '/mpesa/callback', ngrok_auth_token: Optional[str] = None, use_https: bool = True) -> Dict[str, Any]:
+        """Start an ngrok HTTPS tunnel to `port` and register `public_url+callback_path` with Daraja.
+
+        - `port`: local port to expose (default 8000)
+        - `callback_path`: path appended to the public URL when registering with Daraja
+        - `ngrok_auth_token`: optional ngrok auth token (or set NGROK_AUTH_TOKEN env var)
+        - `use_https`: whether to prefer an HTTPS tunnel (default True)
+
+        Returns dict: `public_url`, `callback_url`, `register_result`.
+        """
+        try:
+            from pyngrok import ngrok
+        except Exception:
+            raise RuntimeError('pyngrok is required for ngrok support; install with `pip install pyngrok`')
+
+        # set auth token if provided
+        token = ngrok_auth_token or os.getenv('NGROK_AUTH_TOKEN')
+        if token:
+            try:
+                ngrok.set_auth_token(token)
+                logger.debug('ngrok auth token set')
+            except Exception:
+                logger.exception('Failed to set ngrok auth token; proceeding without setting it')
+
+        proto = 'https' if use_https else 'http'
+        logger.info('Starting ngrok tunnel for port %s (proto=%s)', port, proto)
+        try:
+            tunnel = ngrok.connect(port, proto)
+        except TypeError:
+            # pyngrok older signature fallback
+            tunnel = ngrok.connect(port)
+
+        public_url = getattr(tunnel, 'public_url', str(tunnel))
+        logger.info('Ngrok tunnel started: %s', public_url)
+        callback_url = public_url.rstrip('/') + callback_path
+
+        logger.debug('Registering callback URL %s with Daraja', callback_url)
+        reg_res = self.register_callback_url(callback_url)
+        return {'public_url': public_url, 'callback_url': callback_url, 'register_result': reg_res}
+
 
 # Hyper-explicit tool metadata for MCP exposure. Each tool lists its exact parameter names and formats.
 TOOLS_METADATA = {
@@ -197,6 +311,26 @@ TOOLS_METADATA = {
         ),
         'args': {
             'url': 'string, HTTPS public URL to receive Daraja callbacks'
+        }
+    }
+    ,
+    'doc_search': {
+        'description': 'doc_search(query): Find the paragraph in the official Daraja docs that best answers `query`.',
+        'args': {
+            'query': 'string, the developer question or phrase to search for',
+            'top_n': 'integer, optional, number of top paragraph matches to return (default 1)'
+        }
+    }
+    ,
+    'start_ngrok_and_register': {
+        'description': (
+            'start_ngrok_and_register(port=8000, callback_path="/mpesa/callback", ngrok_auth_token=None): '
+            'Start an ngrok tunnel to the local `port` and register the public HTTPS callback URL with Daraja.'
+        ),
+        'args': {
+            'port': 'integer, local port to expose (default 8000)',
+            'callback_path': 'string, path appended to public URL when registering (default /mpesa/callback)',
+            'ngrok_auth_token': 'string, optional ngrok auth token (or set NGROK_AUTH_TOKEN env var)'
         }
     }
 }
